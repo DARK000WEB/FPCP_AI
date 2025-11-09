@@ -1,6 +1,16 @@
 
+<p align="center">
+  <img src="https://img.shields.io/badge/Status-CLASSIFIED-red?style=for-the-badge" alt="Classified Badge">
+</p>
+
+<p align="center">
+  <span style="font-size: 2em; color: #00ffff; text-shadow: 0 0 10px #00ffff;">💀</span>
+  <br>
+  <span style="font-family: 'Orbitron', sans-serif; font-size: 2.5em; color: #00ffff; text-shadow: 0 0 10px #00ffff, 0 0 20px #0080ff;">DARK@WEB</span>
+</p>
 
 # AI-Powered Article Generation and Retrieval: A Deep Dive into the AI Processes
+
 <p align="center">
   <img src="https://img.shields.io/badge/Status-AI_POWERED-blue?style=for-the-badge" alt="AI Powered Badge">
 </p>
@@ -9,7 +19,6 @@
   <span style="font-size: 2em; color: #00ffff; text-shadow: 0 0 10px #00ffff;">🤖</span>
   <br>
   <span style="font-family: 'Orbitron', sans-serif; font-size: 2.5em; color: #00ffff; text-shadow: 0 0 10px #00ffff, 0 0 20px #0080ff;">AI-POWERED ARTICLE GENERATION & RETRIEVAL</span>
-  <span style="font-family: 'Orbitron', sans-serif; font-size: 2.5em; color: #00ffff; text-shadow: 0 0 10px #00ffff, 0 0 20px #0080ff;">DARK@WEB</span>
 </p>
 ## Introduction
 
