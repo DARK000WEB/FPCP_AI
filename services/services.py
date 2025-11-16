@@ -14,11 +14,38 @@ from uuid import uuid4
 from docx import Document
 from fpdf import FPDF
 from io import BytesIO
-from utils.keys import *
 import numpy as np
-import requests
 import faiss
 import bcrypt
+import torch
+import torch.nn as nn
+from transformers import (
+    AutoTokenizer,
+    AutoModelForCausalLM,
+    BitsAndBytesConfig,
+    DebertaV2ForSequenceClassification,
+    DebertaV2Tokenizer,
+)
+from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+from sentence_transformers import SentenceTransformer
+from datasets import load_dataset
+import nltk
+from nltk.tokenize import sent_tokenize
+from rank_bm25 import BM25Okapi
+from trl import SFTTrainer
+import matplotlib.pyplot as plt
+from pylatexenc.latexencode import latexencode
+import requests
+from evaluate import load
+import difflib
+import logging
+from torch.nn.parallel import DistributedDataParallel as DDP
+import os
+
+nltk.download("punkt", quiet=True)
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 
 def hash_password(password: str) -> str:
@@ -53,10 +80,6 @@ class UserOperation:
 
         async with self.db_session as session:
             try:
-                print(
-                    f"Attempting to register user with username: {username} and phone_number: {phone_number}"
-                )
-
                 existing_user = await session.execute(
                     select(UserModel).where(
                         (UserModel.username == username)
@@ -83,9 +106,8 @@ class UserOperation:
                 session.add(new_user)
                 await session.commit()
                 return RegisterOutput(username=new_user.username, id=new_user.id)
-            except IntegrityError as e:
+            except IntegrityError:
                 await session.rollback()
-                print(f"IntegrityError: {e.orig}")
                 raise HTTPException(
                     status_code=400,
                     detail="User with this username or phone number already exists.",
@@ -107,7 +129,6 @@ class UserOperation:
             return {"token": token, "user_id": user.id}
 
     async def get_user_by_username(self, username: str):
-
         stmt = select(UserModel).where(UserModel.username == username)
         result = await self.db_session.execute(stmt)
         user = result.scalar_one_or_none()
@@ -186,16 +207,10 @@ class UserOperation:
         if not user:
             raise HTTPException(status_code=404, detail="User not found.")
 
-        hashed_password = self.hash_password(new_password)
+        hashed_password = hash_password(new_password)
         user.password = hashed_password
         await self.db_session.commit()
         return {"message": "Password updated successfully."}
-
-    def hash_password(self, password: str) -> str:
-        from passlib.context import CryptContext
-
-        pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-        return pwd_context.hash(password)
 
     async def generate_recovery_code(self, username: str) -> str:
         stmt = select(UserModel).where(UserModel.username == username)
@@ -208,7 +223,6 @@ class UserOperation:
         recovery_code = str(uuid4()).split("-")[0]
         user.recovery_code = recovery_code
         await self.db_session.commit()
-
         return recovery_code
 
     async def verify_recovery_code_and_reset_password(
@@ -228,7 +242,6 @@ class UserOperation:
         await user_operation_service.reset_password_by_username(username, new_password)
         user.recovery_code = None
         await self.db_session.commit()
-
         return {"detail": "Password reset successfully."}
 
 
@@ -310,167 +323,313 @@ class TextOperation:
             return result_list
 
 
-class ArticleRetriever:
+class CoherenceModel(nn.Module):
+    def __init__(self, input_dim=768):
+        super(CoherenceModel, self).__init__()
+        self.fc = nn.Linear(input_dim, 1)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        return self.sigmoid(self.fc(x))
+
+
+class KnowledgeBase:
     def __init__(self, db_session: AsyncSession) -> None:
         self.db_session = db_session
-        self.ai_api_key = AI_API_KEY
+        self.embedder = SentenceTransformer("all-mpnet-base-v2")
         self.index = None
         self.id_map = []
+        self.dimension = 768
+        self.memory = []
+        self.bm25 = None
 
-    async def build_faiss_index(self):
+    async def build_index(self, use_fallback_dataset=True):
         async with self.db_session as session:
-            articles = await session.execute(select(ArticleModel))
-            articles = articles.scalars().all()
+            result = await session.execute(select(ArticleModel))
+            articles = result.scalars().all()
 
-        article_vectors = [self.embed_article(article.content) for article in articles]
-        if not article_vectors:
-            raise Exception("No articles to build index")
+        vectors = []
+        self.id_map = []
+        corpus = []
+        for article in articles:
+            vector = self.embedder.encode(article.content)
+            vectors.append(vector)
+            self.id_map.append(article.id)
+            corpus.append(article.content.split())
 
-        vectors = np.array(article_vectors).astype(np.float32)
-        self.index = faiss.IndexFlatL2(vectors.shape[1])
-        faiss.normalize_L2(vectors)
-        self.index.add(vectors)
-        self.id_map = [article.id for article in articles]
+        if not articles and use_fallback_dataset:
+            dataset = load_dataset("pubmed", split="train[:1000]")
+            for doc in dataset:
+                content = doc["abstract"] + "\n" + doc["text"]
+                vector = self.embedder.encode(content)
+                vectors.append(vector)
+                self.id_map.append(uuid4())
+                corpus.append(content.split())
 
-    def embed_article(self, text: str) -> np.ndarray:
-        url = "https://api.cohere.ai/v1/embed"
-        headers = {
-            "Authorization": f"Bearer {self.ai_api_key}",
-            "Content-Type": "application/json",
-        }
-        payload = {"texts": [text]}
-        response = requests.post(url, headers=headers, json=payload)
-        if response.status_code == 200:
-            embeddings = response.json().get("embeddings", [])
-            return np.array(embeddings[0], dtype=np.float32)
-        else:
-            raise HTTPException(status_code=500, detail="Embedding failed")
+        if vectors:
+            vectors = np.array(vectors).astype("float32")
+            self.index = faiss.IndexFlatL2(self.dimension)
+            faiss.normalize_L2(vectors)
+            self.index.add(vectors)
+            self.bm25 = BM25Okapi(corpus)
 
-    async def add_to_faiss_index(self, article_vector: np.ndarray, article_id: UUID):
+    def retrieve_hybrid(self, query: str, top_k: int = 5) -> list:
         if self.index is None:
-            self.index = faiss.IndexFlatL2(article_vector.shape[0])
+            return []
 
-        vector = np.array([article_vector]).astype(np.float32)
-        faiss.normalize_L2(vector)
-        self.index.add(vector)
-        self.id_map.append(article_id)
-
-    def retrieve_relevant_articles(self, query_vector: np.ndarray, top_k=5) -> list:
-        if self.index is None:
-            raise Exception("Index has not been built yet.")
-
-        query_vector = np.array([query_vector]).astype(np.float32)
+        query_vector = self.embedder.encode(query)
+        query_vector = np.array([query_vector]).astype("float32")
         faiss.normalize_L2(query_vector)
-        distances, indices = self.index.search(query_vector, top_k)
+        distances_sem, indices_sem = self.index.search(query_vector, top_k)
 
-        retrieved_ids = []
-        for idx in indices[0]:
-            if idx < len(self.id_map):
-                retrieved_ids.append(self.id_map[idx])
+        tokenized_query = query.split()
+        doc_scores = self.bm25.get_scores(tokenized_query)
+        indices_key = np.argsort(doc_scores)[-top_k:]
 
-        return retrieved_ids
+        hybrid_indices = list(set(list(indices_sem[0]) + list(indices_key)))
+        retrieved_ids = [
+            self.id_map[idx] for idx in hybrid_indices if idx < len(self.id_map)
+        ]
+        return retrieved_ids[:top_k]
+
+    async def fetch_external_knowledge(self, query: str, top_k: int = 3) -> list:
+
+        try:
+            response = requests.get(
+                f"https://api.crossref.org/works?query={query}&rows={top_k}", timeout=5
+            )
+            if response.status_code == 200:
+                items = response.json().get("message", {}).get("items", [])
+                return [
+                    item.get("abstract", "") or item.get("title", "") for item in items
+                ]
+        except Exception as e:
+            logger.error(f"Error fetching external knowledge: {e}")
+            return []
+        return []
+
+    def add_memory(self, context: str):
+        self.memory.append(context)
 
 
-class ArticleGenerator:
-    def __init__(self) -> None:
-        self.api_key = AI_API_KEY
+class Agent:
+    def __init__(self, model, tokenizer):
+        self.model = model
+        self.tokenizer = tokenizer
+        self.cache = {}  # Added for caching
 
-    def generate_article(
-        self,
-        user_text: str,
-        relevant_articles: list,
-    ) -> str:
-        articles_content = "\n".join([article.content for article in relevant_articles])
+    def act(self, prompt: str, max_len: int = 1500) -> str:
+        # Check cache
+        cache_key = hash(prompt)
+        if cache_key in self.cache:
+            return self.cache[cache_key]
 
-        full_prompt = (
-            "Using the following user-provided text and research articles, write an academic-style article strictly based on the given title.\n"
-            "Avoid generic introductions or unrelated content. Stay focused on the core subject.\n\n"
-            f"User text:\n{user_text}\n\n"
-            f"Research articles:\n{articles_content}\n\n"
-            "Article:"
+        inputs = self.tokenizer(prompt, return_tensors="pt")
+        outputs = self.model.generate(
+            **inputs,
+            max_length=max_len,
+            num_beams=5,
+            temperature=0.7,
+            use_cache=True,  # Enable kv-cache
         )
+        result = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
+        self.cache[cache_key] = result
+        return result
 
-        url = "https://api.cohere.ai/v1/generate"
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
-        }
 
-        payload = {
-            "prompt": full_prompt,
-            "max_tokens": 6000,
-            "temperature": 0.7,
-        }
+class PlannerAgent(Agent):
+    def __init__(self) -> None:
+        quantization_config = BitsAndBytesConfig(load_in_4bit=True)
+        model = AutoModelForCausalLM.from_pretrained(
+            "meta-llama/Llama-3-70B", quantization_config=quantization_config
+        )
+        tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3-70B")
+        lora_config = LoraConfig(
+            r=16, lora_alpha=32, target_modules=["q_proj", "v_proj", "k_proj", "o_proj"]
+        )
+        model = prepare_model_for_kbit_training(model)
+        model = get_peft_model(model, lora_config)
+        super().__init__(model, tokenizer)
 
-        response = requests.post(url, headers=headers, json=payload)
+    def generate_outline(self, text: str) -> list:
+        prompt = f"Act as planner agent: Generate detailed outline for scientific article based on: {text}. Include abstract, keywords, introduction, methods, results, discussion, conclusion, references, and figure descriptions."
+        outline_text = self.act(prompt, max_len=400)
+        sections = [s.strip() for s in outline_text.split("\n") if s.strip()]
+        return sections
 
-        if response.status_code == 200:
-            return response.json().get("generations", [{}])[0].get("text", "")
-        else:
-            raise Exception("Failed to generate article")
+
+class GeneratorAgent(Agent):
+    def __init__(self) -> None:
+        quantization_config = BitsAndBytesConfig(load_in_4bit=True)
+        model = AutoModelForCausalLM.from_pretrained(
+            "meta-llama/Llama-3-70B", quantization_config=quantization_config
+        )
+        tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3-70B")
+        lora_config = LoraConfig(
+            r=16, lora_alpha=32, target_modules=["q_proj", "v_proj", "k_proj", "o_proj"]
+        )
+        model = prepare_model_for_kbit_training(model)
+        model = get_peft_model(model, lora_config)
+        super().__init__(model, tokenizer)
+
+    def generate_section(
+        self,
+        section: str,
+        context: str,
+        header: str,
+        control: str = "medium",
+        user_degree: str = "bachelor",
+    ) -> str:
+        complexity = (
+            "advanced" if user_degree.lower() in ["phd", "master"] else "simple"
+        )
+        prompt = f"Act as generator agent: Generate detailed {control}-length section '{section}' for article '{header}'. Use context: {context}. Ensure scientific accuracy, {complexity} terminology, and add figure descriptions and LaTeX equations if needed."
+        text = self.act(prompt)
+        if "results" in section.lower():
+            text += "\n" + self.generate_visualization(section)
+        return text
+
+    def generate_visualization(self, section: str) -> str:
+        fig, ax = plt.subplots()
+        x = np.linspace(0, 10, 100)
+        y = np.sin(x)
+        ax.plot(x, y, label="Sample Data")
+        ax.set_title(f"Visualization for {section}")
+        ax.set_xlabel("X-axis")
+        ax.set_ylabel("Y-axis")
+        ax.legend()
+        buffer = BytesIO()
+        plt.savefig(buffer, format="png")
+        plt.close()
+        buffer.seek(0)
+        file_path = save_file(f"figure_{uuid4()}.png", buffer)
+        return f"Figure: Sample plot saved at {file_path}"
+
+
+class CriticAgent:
+    def __init__(self) -> None:
+        self.classifier = DebertaV2ForSequenceClassification.from_pretrained(
+            "microsoft/deberta-v3-large"
+        )
+        self.tokenizer = DebertaV2Tokenizer.from_pretrained(
+            "microsoft/deberta-v3-large"
+        )
+        self.coherence_model = CoherenceModel()
+        self.embedder = SentenceTransformer("all-mpnet-base-v2")
+        self.rouge = load("rouge")
+        self.bleu = load("bleu")
+
+    def evaluate_coherence(self, text: str) -> float:
+        sentences = sent_tokenize(text)
+        embeddings = self.embedder.encode(sentences)
+        embeddings_tensor = torch.tensor(embeddings).float()
+        scores = self.coherence_model(embeddings_tensor).mean().item()
+        return scores
+
+    def critique(self, text: str, reference: str = None) -> dict:
+        inputs = self.tokenizer(text[:512], return_tensors="pt")
+        outputs = self.classifier(**inputs)
+        label = outputs.logits.argmax().item()
+        coherence = self.evaluate_coherence(text)
+        metrics = {}
+        if reference:
+            metrics["rouge"] = self.rouge.compute(
+                predictions=[text], references=[reference]
+            )
+            metrics["bleu"] = self.bleu.compute(
+                predictions=[text], references=[[reference]]
+            )
+        critique = (
+            "Needs improvement: low coherence."
+            if label == 0 or coherence < 0.8
+            else "Good quality."
+        )
+        return {"critique": critique, "coherence": coherence, "metrics": metrics}
+
+
+class Retriever:
+    def __init__(self, knowledge_base: KnowledgeBase, db_session: AsyncSession) -> None:
+        self.knowledge_base = knowledge_base
+        self.db_session = db_session
+
+    async def build_context(self, section: str, iterations=3) -> str:
+        context = ""
+        query = section
+        for _ in range(iterations):
+            retrieved_ids = self.knowledge_base.retrieve_hybrid(query)
+            async with self.db_session as session:
+                result = await session.execute(
+                    select(ArticleModel).where(ArticleModel.id.in_(retrieved_ids))
+                )
+                articles = result.scalars().all()
+            new_context = "\n".join([article.content for article in articles])
+            external_context = await self.knowledge_base.fetch_external_knowledge(query)
+            context += new_context + "\n" + "\n".join(external_context) + "\n"
+            query = f"Refine query using chain-of-thought: {query} based on new info {new_context[:200]}"
+            self.knowledge_base.add_memory(context)
+        return context
+
+
+class PostProcessor:
+    def __init__(self) -> None:
+        self.critic = CriticAgent()
+
+    def process(self, text: str) -> str:
+        sentences = sent_tokenize(text)
+        unique_sentences = []
+        for sent in sentences:
+            if sent not in unique_sentences:
+                unique_sentences.append(sent)
+        text = " ".join(unique_sentences).strip()
+        score = self.critic.evaluate_coherence(text)
+        if score < 0.8:
+            text = f"[Refined for coherence: {score}] " + text
+        return text
+
+    def check_plagiarism(self, text: str, reference_texts: list) -> float:
+        max_similarity = 0
+        for ref in reference_texts:
+            seq = difflib.SequenceMatcher(None, text, ref)
+            similarity = seq.ratio()
+            max_similarity = max(max_similarity, similarity)
+        return max_similarity
+
+    def generate_references(self, query: str) -> str:
+        external_refs = KnowledgeBase(None).fetch_external_knowledge(query, top_k=5)
+        refs = [f"{i+1}. {ref[:200]}..." for i, ref in enumerate(external_refs)]
+        return "References:\n" + "\n".join(refs)
+
+    def generate_figure_desc(self, section: str) -> str:
+        return f"Figure for {section}: A diagram illustrating key concepts, generated using Matplotlib."
 
 
 class ArticleOperation:
     def __init__(self, db_session: AsyncSession) -> None:
         self.db_session = db_session
-        self.retriever = ArticleRetriever(db_session)
-        self.generator = ArticleGenerator()
+        self.knowledge_base = KnowledgeBase(db_session)
+        self.planner_agent = PlannerAgent()
+        self.generator_agent = GeneratorAgent()
+        self.critic_agent = CriticAgent()
+        self.retriever = Retriever(self.knowledge_base, db_session)
+        self.post_processor = PostProcessor()
 
-    async def extract_keywords(self, text_id: UUID) -> list:
-        async with self.db_session as session:
-            text = await session.execute(
-                select(TextModel).where(TextModel.id == text_id)
-            )
-            text = text.scalars().first()
-            if not text:
-                raise HTTPException(status_code=404, detail="Text not found")
-
-        url = "https://api.cohere.ai/v1/generate"
-        headers = {
-            "Authorization": f"Bearer {self.retriever.ai_api_key}",
-            "Content-Type": "application/json",
-        }
-        payload = {
-            "prompt": f"Extract clear, topic-focused keywords from this academic text:\n{text.text}",
-            "max_tokens": 80,
-        }
-        response = requests.post(url, headers=headers, json=payload)
-
-        if response.status_code == 200:
-            return (
-                response.json().get("generations", [{}])[0].get("text", "").split(", ")
-            )
-        else:
-            raise HTTPException(status_code=500, detail="Keyword extraction failed")
-
-    async def search_articles_with_crossref(self, keywords: list) -> list:
-        search_results = []
-        joined_keywords = " ".join(keywords)
-        url = f"https://api.crossref.org/works?query={joined_keywords}&rows=40"
-
-        response = requests.get(url)
-        if response.status_code == 200:
-            results = response.json().get("message", {}).get("items", [])
-            for item in results:
-                abstract = item.get("abstract")
-                title = item.get("title", [None])[0]
-                if title and abstract:
-                    search_results.append(
-                        {
-                            "title": title,
-                            "link": item.get("URL", "No link"),
-                            "snippet": abstract,
-                        }
-                    )
-        else:
-            raise HTTPException(
-                status_code=500,
-                detail=f"CrossRef API failed: {response.status_code} - {response.text}",
-            )
-
-        return search_results
+    async def fine_tune_lora(self):
+        dataset = load_dataset("pubmed", split="train[:1000]")
+        model = self.generator_agent.model
+        tokenizer = self.generator_agent.tokenizer
+        trainer = SFTTrainer(
+            model=model,
+            tokenizer=tokenizer,
+            train_dataset=dataset,
+            dataset_text_field="abstract",
+            max_seq_length=512,
+        )
+        trainer.train()
+        logger.info("LoRA fine-tuned with PubMed dataset.")
 
     async def generate_article(self, user_id: UUID, text_id: UUID, header: str) -> dict:
+        await self.fine_tune_lora()
+
         async with self.db_session as session:
             user = await session.execute(
                 select(UserModel).where(UserModel.id == user_id)
@@ -486,50 +645,47 @@ class ArticleOperation:
             if not text:
                 raise HTTPException(status_code=404, detail="Text not found")
 
-        keywords = await self.extract_keywords(text_id)
-        articles_from_crossref = await self.search_articles_with_crossref(keywords)
+        await self.knowledge_base.build_index(use_fallback_dataset=True)
+        outline = self.planner_agent.generate_outline(text.text)
 
-        valid_articles = []
-        async with self.db_session as session:
-            for article in articles_from_crossref:
-                new_article = ArticleModel(
-                    title=article["title"],
-                    header=header,
-                    content=article["snippet"],
-                    link=article["link"],
-                    snippet=article["snippet"],
-                    user_id=user_id,
-                    text_id=text_id,
-                    created_at=datetime.utcnow(),
-                )
-                session.add(new_article)
-                valid_articles.append(new_article)
-            await session.commit()
-
-        for article in valid_articles:
-            vector = self.retriever.embed_article(article.content)
-            await self.retriever.add_to_faiss_index(vector, article.id)
-
-        await self.retriever.build_faiss_index()
-        query_vector = self.retriever.embed_article(text.text)
-        relevant_ids = self.retriever.retrieve_relevant_articles(query_vector)
-
-        async with self.db_session as session:
-            result = await session.execute(
-                select(ArticleModel).where(ArticleModel.id.in_(relevant_ids))
+        generated_sections = {}
+        for section in outline:
+            context = await self.retriever.build_context(section)
+            section_text = self.generator_agent.generate_section(
+                section,
+                context,
+                header,
+                control=user.degree.lower(),
+                user_degree=user.degree,
             )
-            relevant_articles = result.scalars().all()
+            critique = self.critic_agent.critique(section_text)
+            if "improvement" in critique["critique"]:
+                section_text = self.generator_agent.generate_section(
+                    section,
+                    context + critique["critique"],
+                    header,
+                    user_degree=user.degree,
+                )
+            generated_sections[section.lower()] = (
+                section_text + "\n" + self.post_processor.generate_figure_desc(section)
+            )
 
-        user_text_with_degree = f"{text.text}\n\n[Academic Level: {user.degree}]"
-
-        generated_text = self.generator.generate_article(
-            user_text=user_text_with_degree,
-            relevant_articles=relevant_articles,
+        generated_text = f"Title: {header}\n\n"
+        generated_text += "Abstract: " + generated_sections.get("abstract", "") + "\n\n"
+        generated_text += (
+            "Keywords: "
+            + ", ".join(generated_sections.get("keywords", "").split())
+            + "\n\n"
         )
+        for sec in ["introduction", "methods", "results", "discussion", "conclusion"]:
+            if sec in generated_sections:
+                generated_text += f"{sec.capitalize()}: {generated_sections[sec]}\n\n"
+        generated_text += await self.post_processor.generate_references(header)
+        generated_text = self.post_processor.process(generated_text)
 
         async with self.db_session as session:
             new_article = AIModel(
-                title=f"Generated Article for {user.degree}",
+                title=f"Generated Article: {header}",
                 model_output=generated_text,
                 user_id=user.id,
                 text_id=text.id,
@@ -541,31 +697,60 @@ class ArticleOperation:
             await session.commit()
 
         return {
-            "success": "Article created successfully",
+            "success": "Article generated successfully",
             "article_id": str(new_article.id),
         }
 
-    async def list_user_generated_articles(self, user_id: UUID) -> list:
+    async def refine_article(self, article_id: UUID, user_id: UUID) -> dict:
         async with self.db_session as session:
-            result = await session.execute(
-                select(AIModel).where(AIModel.user_id == user_id)
-            )
-            articles = result.scalars().all()
-
-            if not articles:
-                raise HTTPException(
-                    status_code=404, detail="No generated articles found for this user."
+            article = await session.execute(
+                select(AIModel).where(
+                    AIModel.id == article_id, AIModel.user_id == user_id
                 )
+            )
+            article = article.scalars().first()
+            if not article:
+                raise HTTPException(status_code=404, detail="Article not found")
 
-            return [
-                {
-                    "id": str(article.id),
-                    "title": article.title,
-                    "model_output": article.model_output,
-                    "created_at": article.created_at,
-                }
-                for article in articles
-            ]
+        refined_text = article.model_output
+        for _ in range(3):
+            critique = self.critic_agent.critique(refined_text)
+            if critique["coherence"] >= 0.8:
+                break
+            refined_text = self.generator_agent.generate_section(
+                "full article",
+                refined_text + "\nCritique: " + critique["critique"],
+                article.title,
+                control="detailed",
+            )
+            refined_text = self.post_processor.process(refined_text)
+
+        article.model_output = refined_text
+        await self.db_session.commit()
+
+        return {
+            "success": "Article refined successfully",
+            "article_id": str(article.id),
+        }
+
+    async def evaluate_article(self, article_id: UUID, user_id: UUID) -> dict:
+        async with self.db_session as session:
+            article = await session.execute(
+                select(AIModel).where(
+                    AIModel.id == article_id, AIModel.user_id == user_id
+                )
+            )
+            article = article.scalars().first()
+            if not article:
+                raise HTTPException(status_code=404, detail="Article not found")
+
+        coherence_score = self.critic_agent.evaluate_coherence(article.model_output)
+        critique = self.critic_agent.critique(article.model_output)
+        return {
+            "coherence_score": coherence_score,
+            "critique": critique["critique"],
+            "metrics": critique["metrics"],
+        }
 
     async def delete_article(self, article_id: UUID) -> None:
         async with self.db_session as session:
@@ -573,9 +758,8 @@ class ArticleOperation:
                 select(AIModel).where(AIModel.id == article_id)
             )
             article = article.scalars().first()
-            if article is None:
-                raise HTTPException(status_code=404, detail="Text not found.")
-
+            if not article:
+                raise HTTPException(status_code=404, detail="Article not found.")
             await session.delete(article)
             await session.commit()
 
@@ -604,7 +788,6 @@ class FileOperation:
 
             pdf_buffer = BytesIO()
             pdf_output = pdf.output(dest="S").encode("latin-1")
-            pdf_buffer = BytesIO()
             pdf_buffer.write(pdf_output)
             pdf_buffer.seek(0)
 
@@ -661,6 +844,40 @@ class FileOperation:
 
             return {"download_url": f"/download/{new_file.id}"}
 
+    async def generate_latex(self, article_id: UUID, user_id: UUID) -> dict:
+        async with self.db_session as session:
+            article = await session.execute(
+                select(AIModel).where(
+                    AIModel.id == article_id, AIModel.user_id == user_id
+                )
+            )
+            article = article.scalars().first()
+            if not article:
+                raise HTTPException(
+                    status_code=404, detail="Article not found or access denied."
+                )
+
+            latex_content = latexencode(article.model_output)
+            buffer = BytesIO()
+            buffer.write(latex_content.encode("utf-8"))
+            buffer.seek(0)
+
+            file_name = f"article_{article.id}.tex"
+            file_path = save_file(file_name, buffer)
+
+            new_file = FileModel(
+                ai_model_id=article.id,
+                user_id=user_id,
+                file_name=file_name,
+                file_path=file_path,
+                file_type="latex",
+                created_at=datetime.utcnow(),
+            )
+            session.add(new_file)
+            await session.commit()
+
+            return {"download_url": f"/download/{new_file.id}"}
+
     async def get_file(self, file_id: UUID, user_id: UUID) -> dict:
         async with self.db_session as session:
             file = await session.execute(
@@ -691,9 +908,7 @@ class TranslationOperation:
             raise HTTPException(status_code=404, detail="Article not found.")
 
         if not ai_article.model_output:
-            raise HTTPException(
-                status_code=400, detail="Article has no content to translate."
-            )
+            raise HTTPException(status_code=400, detail="No content to translate.")
 
         original_text = ai_article.model_output
         chunk_size = 3000
@@ -709,10 +924,9 @@ class TranslationOperation:
 
         full_translation = "\n".join(translated_chunks)
         ai_article.translated_output = full_translation
-
         await self.db_session.commit()
 
         return {
-            "detail": "Article translated and saved successfully.",
+            "detail": "Translated successfully.",
             "translated_text": full_translation,
         }
