@@ -12,7 +12,7 @@
 <p align="center">
   <span style="font-size: 3.8em;">Brain</span><br>
   <strong style="font-size: 2.5em; background: linear-gradient(90deg, #00ffff, #0080ff); -webkit-background-clip: text; -webkit-text-fill-color: transparent;">
-    DARK@WEB FPCP
+    DARK@WEB
   </strong><br>
   <i>Advanced Fully-Automatic Scientific Article Generation Platform Powered by AI</i>
 </p>
