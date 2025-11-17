@@ -6,7 +6,6 @@ from sqlalchemy.ext.declarative import declarative_base
 from .engine import Base
 
 
-# User Model
 class UserModel(Base):
     __tablename__ = "users"
 
@@ -22,7 +21,6 @@ class UserModel(Base):
     id: Mapped[UUID] = mapped_column(primary_key=True, default_factory=uuid4)
 
 
-# Text Model
 class TextModel(Base):
     __tablename__ = "texts"
 
@@ -32,7 +30,6 @@ class TextModel(Base):
     id: Mapped[UUID] = mapped_column(primary_key=True, default_factory=uuid4)
 
 
-# Article Model
 class ArticleModel(Base):
     __tablename__ = "articles"
 
@@ -47,7 +44,6 @@ class ArticleModel(Base):
     id: Mapped[UUID] = mapped_column(primary_key=True, default_factory=uuid4)
 
 
-# AI Model
 class AIModel(Base):
     __tablename__ = "ai_models"
 
@@ -61,7 +57,6 @@ class AIModel(Base):
     id: Mapped[UUID] = mapped_column(primary_key=True, default_factory=uuid4)
 
 
-# File Model
 class FileModel(Base):
     __tablename__ = "files"
 

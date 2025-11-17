@@ -56,9 +56,7 @@ async def login_user(
 async def get_user_profile(
     db_session: Annotated[AsyncSession, Depends(get_db)],
     username: str,
-    token_data: JWTPayload = Depends(
-        JWTHandler.verify_token
-    ),  # Improved JWT validation
+    token_data: JWTPayload = Depends(JWTHandler.verify_token),
 ):
     user_operation = UserOperation(db_session)
     user_profile = await user_operation.get_user_by_username(username)
@@ -98,7 +96,7 @@ async def create_text(
     db_session: Annotated[AsyncSession, Depends(get_db)],
     user_id: UUID = Query(...),
     request: TextCreateRequest = Body(...),
-    token_data: JWTPayload = Depends(JWTHandler.verify_token),  # Added JWT for security
+    token_data: JWTPayload = Depends(JWTHandler.verify_token),
 ):
     text_operation = TextOperation(db_session)
     return await text_operation.create_text(user_id, request.text_content)

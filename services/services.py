@@ -416,10 +416,10 @@ class Agent:
     def __init__(self, model, tokenizer):
         self.model = model
         self.tokenizer = tokenizer
-        self.cache = {}  # Added for caching
+        self.cache = {}
 
     def act(self, prompt: str, max_len: int = 1500) -> str:
-        # Check cache
+
         cache_key = hash(prompt)
         if cache_key in self.cache:
             return self.cache[cache_key]
@@ -430,7 +430,7 @@ class Agent:
             max_length=max_len,
             num_beams=5,
             temperature=0.7,
-            use_cache=True,  # Enable kv-cache
+            use_cache=True,
         )
         result = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
         self.cache[cache_key] = result
