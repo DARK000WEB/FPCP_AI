@@ -40,7 +40,6 @@ from evaluate import load
 import difflib
 import logging
 from torch.nn.parallel import DistributedDataParallel as DDP
-import os
 
 nltk.download("punkt", quiet=True)
 
